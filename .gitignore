@@ -1,0 +1,5 @@
+backend/.env
+frontend/.env
+backend/firebase-credentials.json
+node_modules/
+dist/
