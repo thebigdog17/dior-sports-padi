@@ -2,10 +2,11 @@
 import { initializeApp } from "firebase/app";
 import {
   getAuth,
-  RecaptchaVerifier,
-  signInWithPhoneNumber,
+  createUserWithEmailAndPassword,
+  signInWithEmailAndPassword,
   signOut,
   onAuthStateChanged,
+  updateProfile,
 } from "firebase/auth";
 
 const firebaseConfig = {
@@ -15,29 +16,19 @@ const firebaseConfig = {
   appId:      import.meta.env.VITE_FIREBASE_APP_ID,
 };
 
-const app  = initializeApp(firebaseConfig);
+const app = initializeApp(firebaseConfig);
 export const auth = getAuth(app);
 
-// ── Phone auth helpers ─────────────────────────────────────────────
-export function setupRecaptcha(containerId) {
-  // invisible recaptcha — user never sees it
-  window.recaptchaVerifier = new RecaptchaVerifier(auth, containerId, {
-    size: "invisible",
-    callback: () => {},
-  });
-  return window.recaptchaVerifier;
+export async function registerUser(email, password, name) {
+  const cred = await createUserWithEmailAndPassword(auth, email, password);
+  await updateProfile(cred.user, { displayName: name });
+  return cred.user;
 }
 
-export async function sendOTP(phoneNumber) {
-  const verifier = window.recaptchaVerifier;
-  const result   = await signInWithPhoneNumber(auth, phoneNumber, verifier);
-  window.confirmationResult = result;
-  return result;
-}
-
-export async function verifyOTP(code) {
-  const result = await window.confirmationResult.confirm(code);
-  return result.user;
+export async function loginUser(email, password) {
+  const cred = await signInWithEmailAndPassword(auth, email, password);
+  return cred.user;
 }
 
 export { signOut, onAuthStateChanged };
+
