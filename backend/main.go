@@ -193,11 +193,10 @@ func (s *Server) fetchAPIFootball(date string) ([]Fixture, error) {
 	}
 
 	// API-Football endpoint: all fixtures for a specific date
-	url := fmt.Sprintf("https://api-football-v1.p.rapidapi.com/v3/fixtures?date=%s", date)
+	url := fmt.Sprintf("https://v3.football.api-sports.io/fixtures?date=%s", date)
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil { return nil, err }
-	req.Header.Set("X-RapidAPI-Key", rapidAPIKey)
-	req.Header.Set("X-RapidAPI-Host", "api-football-v1.p.rapidapi.com")
+	req.Header.Set("x-apisports-key", rapidAPIKey)
 
 	resp, err := s.httpClient.Do(req)
 	if err != nil { return nil, err }
