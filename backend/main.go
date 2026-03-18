@@ -24,7 +24,6 @@ import (
 	"google.golang.org/api/option"
 )
 
-// ─── CONFIG ───────────────────────────────────────────────────────
 var (
 	mongoURI          string
 	rapidAPIKey       string
@@ -91,19 +90,21 @@ type SavedTicket struct {
 	CreatedAt time.Time          `bson:"createdAt"     json:"createdAt"`
 }
 
-// ─── NORMALISED FIXTURE (common format for frontend) ──────────────
 type Fixture struct {
-	ID         string `json:"id"`
-	HomeTeam   string `json:"home_name"`
-	AwayTeam   string `json:"away_name"`
-	HomeScore  *int   `json:"home_score"`
-	AwayScore  *int   `json:"away_score"`
-	Status     string `json:"status"`
-	Date       string `json:"date"`
-	Time       string `json:"time"`
-	LeagueName string `json:"league_name"`
-	LeagueLogo string `json:"league_logo"`
-	Country    string `json:"country"`
+	ID         string  `json:"id"`
+	HomeTeam   string  `json:"home_name"`
+	AwayTeam   string  `json:"away_name"`
+	HomeScore  *int    `json:"home_score"`
+	AwayScore  *int    `json:"away_score"`
+	Status     string  `json:"status"`
+	Minute     string  `json:"minute"`
+	Date       string  `json:"date"`
+	Time       string  `json:"time"`
+	LeagueName string  `json:"league_name"`
+	LeagueLogo string  `json:"league_logo"`
+	Country    string  `json:"country"`
+	HomeLogo   string  `json:"home_logo"`
+	AwayLogo   string  `json:"away_logo"`
 }
 
 // ─── SERVER ───────────────────────────────────────────────────────
@@ -146,7 +147,6 @@ func jsonOK(w http.ResponseWriter, v interface{}) {
 	json.NewEncoder(w).Encode(v)
 }
 
-// ─── HEALTH ───────────────────────────────────────────────────────
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, map[string]interface{}{"status": "ok", "timestamp": time.Now().UTC()})
 }
@@ -156,25 +156,14 @@ func (s *Server) handleRegisterProfile(w http.ResponseWriter, r *http.Request) {
 	uid := r.Context().Value("uid").(string)
 	var body struct {
 		Name  string `json:"name"`
-		Email string `json:"email"`
 	}
 	json.NewDecoder(r.Body).Decode(&body)
-
 	fireUser, err := s.fireAuth.GetUser(r.Context(), uid)
 	if err != nil { jsonErr(w, "Firebase user not found", 400); return }
-
-	email := fireUser.Email
-	if email == "" { email = body.Email }
-
 	col := s.db.Collection("users")
 	filter := bson.M{"firebaseUid": uid}
 	update := bson.M{
-		"$set": bson.M{
-			"firebaseUid": uid,
-			"email":       email,
-			"name":        body.Name,
-			"updatedAt":   time.Now(),
-		},
+		"$set": bson.M{"firebaseUid": uid, "email": fireUser.Email, "name": body.Name, "updatedAt": time.Now()},
 		"$setOnInsert": bson.M{"createdAt": time.Now()},
 	}
 	col.UpdateOne(r.Context(), filter, update, options.Update().SetUpsert(true))
@@ -186,20 +175,138 @@ func (s *Server) handleRegisterProfile(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleGetProfile(w http.ResponseWriter, r *http.Request) {
 	uid := r.Context().Value("uid").(string)
 	var user User
-	err := s.db.Collection("users").FindOne(r.Context(), bson.M{"firebaseUid": uid}).Decode(&user)
-	if err != nil { jsonErr(w, "User not found", 404); return }
+	if err := s.db.Collection("users").FindOne(r.Context(), bson.M{"firebaseUid": uid}).Decode(&user); err != nil {
+		jsonErr(w, "User not found", 404); return
+	}
 	jsonOK(w, user)
 }
 
-// ─── SCORES: TheSportsDB (free, no key, 100s of leagues) ─────────
-func (s *Server) fetchTSDB(date string) ([]Fixture, error) {
-	cacheKey := "tsdb:" + date
+// ─── API-FOOTBALL: full global coverage ───────────────────────────
+// Fetches ALL fixtures for a date using API-Football v3
+// Uses the /fixtures endpoint with date parameter — covers 900+ leagues
+func (s *Server) fetchAPIFootball(date string) ([]Fixture, error) {
+	cacheKey := "apif:" + date
 	if cached, ok := s.cache.Get(cacheKey); ok {
-		var fixtures []Fixture
-		json.Unmarshal(cached, &fixtures)
-		return fixtures, nil
+		var f []Fixture
+		json.Unmarshal(cached, &f)
+		return f, nil
 	}
 
+	// API-Football endpoint: all fixtures for a specific date
+	url := fmt.Sprintf("https://api-football-v1.p.rapidapi.com/v3/fixtures?date=%s", date)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil { return nil, err }
+	req.Header.Set("X-RapidAPI-Key", rapidAPIKey)
+	req.Header.Set("X-RapidAPI-Host", "api-football-v1.p.rapidapi.com")
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil { return nil, err }
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil { return nil, err }
+
+	log.Printf("API-Football response for %s: status=%d, size=%d bytes", date, resp.StatusCode, len(body))
+
+	// Parse API-Football v3 response format
+	var apiResp struct {
+		Response []struct {
+			Fixture struct {
+				ID     int    `json:"id"`
+				Date   string `json:"date"`
+				Status struct {
+					Short   string `json:"short"`
+					Long    string `json:"long"`
+					Elapsed *int   `json:"elapsed"`
+				} `json:"status"`
+			} `json:"fixture"`
+			League struct {
+				Name    string `json:"name"`
+				Country string `json:"country"`
+				Logo    string `json:"logo"`
+			} `json:"league"`
+			Teams struct {
+				Home struct {
+					Name string `json:"name"`
+					Logo string `json:"logo"`
+				} `json:"home"`
+				Away struct {
+					Name string `json:"name"`
+					Logo string `json:"logo"`
+				} `json:"away"`
+			} `json:"teams"`
+			Goals struct {
+				Home *int `json:"home"`
+				Away *int `json:"away"`
+			} `json:"goals"`
+			Score struct {
+				Halftime struct {
+					Home *int `json:"home"`
+					Away *int `json:"away"`
+				} `json:"halftime"`
+				Fulltime struct {
+					Home *int `json:"home"`
+					Away *int `json:"away"`
+				} `json:"fulltime"`
+			} `json:"score"`
+		} `json:"response"`
+		Errors interface{} `json:"errors"`
+	}
+
+	if err := json.Unmarshal(body, &apiResp); err != nil {
+		log.Printf("Parse error: %v — body: %s", err, string(body[:min(200, len(body))]))
+		return nil, err
+	}
+
+	log.Printf("API-Football returned %d fixtures for %s", len(apiResp.Response), date)
+
+	var fixtures []Fixture
+	for _, r := range apiResp.Response {
+		// parse kickoff time
+		koTime := ""
+		if r.Fixture.Date != "" {
+			if t, err := time.Parse(time.RFC3339, r.Fixture.Date); err == nil {
+				koTime = t.Format("15:04")
+			}
+		}
+
+		// elapsed minute
+		minute := ""
+		if r.Fixture.Status.Elapsed != nil {
+			minute = fmt.Sprintf("%d'", *r.Fixture.Status.Elapsed)
+		}
+
+		fixtures = append(fixtures, Fixture{
+			ID:         fmt.Sprintf("%d", r.Fixture.ID),
+			HomeTeam:   r.Teams.Home.Name,
+			AwayTeam:   r.Teams.Away.Name,
+			HomeScore:  r.Goals.Home,
+			AwayScore:  r.Goals.Away,
+			Status:     r.Fixture.Status.Short,
+			Minute:     minute,
+			Date:       date,
+			Time:       koTime,
+			LeagueName: r.League.Name,
+			LeagueLogo: r.League.Logo,
+			Country:    r.League.Country,
+			HomeLogo:   r.Teams.Home.Logo,
+			AwayLogo:   r.Teams.Away.Logo,
+		})
+	}
+
+	if len(fixtures) > 0 {
+		data, _ := json.Marshal(fixtures)
+		// cache 60s for today (live), 10min for past/future
+		ttl := 60 * time.Second
+		if date != time.Now().Format("2006-01-02") {
+			ttl = 10 * time.Minute
+		}
+		s.cache.Set(cacheKey, data, ttl)
+	}
+	return fixtures, nil
+}
+
+// TheSportsDB as fallback (free, no key)
+func (s *Server) fetchTSDB(date string) ([]Fixture, error) {
 	url := fmt.Sprintf("https://www.thesportsdb.com/api/v1/json/3/eventsday.php?d=%s&s=Soccer", date)
 	resp, err := s.httpClient.Get(url)
 	if err != nil { return nil, err }
@@ -208,46 +315,42 @@ func (s *Server) fetchTSDB(date string) ([]Fixture, error) {
 
 	var tsdbResp struct {
 		Events []struct {
-			IDEvent       string `json:"idEvent"`
-			StrHomeTeam   string `json:"strHomeTeam"`
-			StrAwayTeam   string `json:"strAwayTeam"`
-			IntHomeScore  *int   `json:"intHomeScore,string"`
-			IntAwayScore  *int   `json:"intAwayScore,string"`
-			StrStatus     string `json:"strStatus"`
-			DateEvent     string `json:"dateEvent"`
-			StrTime       string `json:"strTime"`
-			StrLeague     string `json:"strLeague"`
+			IDEvent      string `json:"idEvent"`
+			StrHomeTeam  string `json:"strHomeTeam"`
+			StrAwayTeam  string `json:"strAwayTeam"`
+			IntHomeScore string `json:"intHomeScore"`
+			IntAwayScore string `json:"intAwayScore"`
+			StrStatus    string `json:"strStatus"`
+			DateEvent    string `json:"dateEvent"`
+			StrTime      string `json:"strTime"`
+			StrLeague    string `json:"strLeague"`
 			StrLeagueBadge string `json:"strLeagueBadge"`
-			StrCountry    string `json:"strCountry"`
-			StrProgress   string `json:"strProgress"`
+			StrCountry   string `json:"strCountry"`
 		} `json:"events"`
 	}
-
-	if err := json.Unmarshal(body, &tsdbResp); err != nil {
-		return nil, err
-	}
+	if err := json.Unmarshal(body, &tsdbResp); err != nil { return nil, err }
 
 	var fixtures []Fixture
 	for _, e := range tsdbResp.Events {
 		status := "NS"
-		switch e.StrStatus {
-		case "Match Finished", "FT", "AET", "PEN":
-			status = "FT"
-		case "In Progress", "HT":
-			status = e.StrStatus
-		case "Postponed":
-			status = "POSTPONED"
-		default:
-			if e.StrProgress != "" {
-				status = "IN_PLAY"
-			}
+		switch strings.ToLower(e.StrStatus) {
+		case "match finished", "ft": status = "FT"
+		case "in progress": status = "IN_PLAY"
+		case "postponed": status = "PST"
+		}
+		var hs, as_ *int
+		if e.IntHomeScore != "" && e.IntHomeScore != "null" {
+			v := 0; fmt.Sscanf(e.IntHomeScore, "%d", &v); hs = &v
+		}
+		if e.IntAwayScore != "" && e.IntAwayScore != "null" {
+			v := 0; fmt.Sscanf(e.IntAwayScore, "%d", &v); as_ = &v
 		}
 		fixtures = append(fixtures, Fixture{
 			ID:         "tsdb_" + e.IDEvent,
 			HomeTeam:   e.StrHomeTeam,
 			AwayTeam:   e.StrAwayTeam,
-			HomeScore:  e.IntHomeScore,
-			AwayScore:  e.IntAwayScore,
+			HomeScore:  hs,
+			AwayScore:  as_,
 			Status:     status,
 			Date:       e.DateEvent,
 			Time:       e.StrTime,
@@ -256,115 +359,12 @@ func (s *Server) fetchTSDB(date string) ([]Fixture, error) {
 			Country:    e.StrCountry,
 		})
 	}
-
-	if len(fixtures) > 0 {
-		data, _ := json.Marshal(fixtures)
-		s.cache.Set(cacheKey, data, 60*time.Second)
-	}
 	return fixtures, nil
 }
 
-// Also try the Free Livescore API as secondary source
-func (s *Server) fetchLivescoreAPI(date string) ([]Fixture, error) {
-	cacheKey := "ls2:" + date
-	if cached, ok := s.cache.Get(cacheKey); ok {
-		var fixtures []Fixture
-		json.Unmarshal(cached, &fixtures)
-		return fixtures, nil
-	}
-
-	// Try multiple endpoints from the free livescore API
-	url := "https://free-livescore-api.p.rapidapi.com/livescore-get?sportname=soccer"
-	req, _ := http.NewRequest("GET", url, nil)
-	req.Header.Set("x-rapidapi-key", rapidAPIKey)
-	req.Header.Set("x-rapidapi-host", "free-livescore-api.p.rapidapi.com")
-
-	resp, err := s.httpClient.Do(req)
-	if err != nil { return nil, err }
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-
-	// Parse the response - try different possible formats
-	var result map[string]interface{}
-	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, err
-	}
-
-	var fixtures []Fixture
-
-	// Format 1: { "data": [...] }
-	if data, ok := result["data"].([]interface{}); ok {
-		for i, item := range data {
-			if m, ok := item.(map[string]interface{}); ok {
-				f := parseGenericMatch(m, i)
-				fixtures = append(fixtures, f)
-			}
-		}
-	}
-
-	// Format 2: { "events": [...] }
-	if len(fixtures) == 0 {
-		if events, ok := result["events"].([]interface{}); ok {
-			for i, item := range events {
-				if m, ok := item.(map[string]interface{}); ok {
-					f := parseGenericMatch(m, i)
-					fixtures = append(fixtures, f)
-				}
-			}
-		}
-	}
-
-	// Format 3: direct array
-	var arr []map[string]interface{}
-	if err := json.Unmarshal(body, &arr); err == nil {
-		for i, m := range arr {
-			f := parseGenericMatch(m, i)
-			fixtures = append(fixtures, f)
-		}
-	}
-
-	if len(fixtures) > 0 {
-		data, _ := json.Marshal(fixtures)
-		s.cache.Set(cacheKey, data, 60*time.Second)
-	}
-	return fixtures, nil
-}
-
-func parseGenericMatch(m map[string]interface{}, idx int) Fixture {
-	getString := func(keys ...string) string {
-		for _, k := range keys {
-			if v, ok := m[k].(string); ok && v != "" { return v }
-		}
-		return ""
-	}
-	getInt := func(keys ...string) *int {
-		for _, k := range keys {
-			switch v := m[k].(type) {
-			case float64:
-				i := int(v); return &i
-			case string:
-				if v != "" && v != "-" {
-					var i int
-					fmt.Sscanf(v, "%d", &i)
-					return &i
-				}
-			}
-		}
-		return nil
-	}
-
-	return Fixture{
-		ID:         fmt.Sprintf("ls_%d", idx),
-		HomeTeam:   getString("home_name", "home", "homeTeam", "home_team", "strHomeTeam"),
-		AwayTeam:   getString("away_name", "away", "awayTeam", "away_team", "strAwayTeam"),
-		HomeScore:  getInt("home_score", "score_home", "homeScore", "goals_home"),
-		AwayScore:  getInt("away_score", "score_away", "awayScore", "goals_away"),
-		Status:     getString("status", "match_status", "event_status", "strStatus"),
-		Date:       getString("date", "event_date", "dateEvent", "match_date"),
-		Time:       getString("time", "event_time", "strTime"),
-		LeagueName: getString("league", "league_name", "strLeague", "competition"),
-		Country:    getString("country", "strCountry"),
-	}
+func min(a, b int) int {
+	if a < b { return a }
+	return b
 }
 
 // GET /api/scores?date=YYYY-MM-DD
@@ -372,54 +372,62 @@ func (s *Server) handleScores(w http.ResponseWriter, r *http.Request) {
 	date := r.URL.Query().Get("date")
 	if date == "" { date = time.Now().Format("2006-01-02") }
 
-	// Primary: TheSportsDB (free, reliable)
-	fixtures, err := s.fetchTSDB(date)
-	if err != nil || len(fixtures) == 0 {
-		// Fallback: Free Livescore API
-		fixtures2, err2 := s.fetchLivescoreAPI(date)
-		if err2 == nil && len(fixtures2) > 0 {
-			fixtures = append(fixtures, fixtures2...)
+	// Primary: API-Football (900+ leagues)
+	fixtures, err := s.fetchAPIFootball(date)
+	if err != nil {
+		log.Printf("API-Football error: %v, falling back to TSDB", err)
+	}
+
+	// Fallback: TheSportsDB if API-Football fails or returns nothing
+	if len(fixtures) == 0 {
+		log.Printf("API-Football returned 0 fixtures, trying TSDB fallback")
+		tsdbFixtures, tsdbErr := s.fetchTSDB(date)
+		if tsdbErr == nil && len(tsdbFixtures) > 0 {
+			fixtures = tsdbFixtures
 		}
 	}
 
-	// Deduplicate
-	seen := map[string]bool{}
-	var unique []Fixture
+	// Sort by status: live first, then NS, then FT
+	var live, ns, ft []Fixture
 	for _, f := range fixtures {
-		key := strings.ToLower(f.HomeTeam + "_" + f.AwayTeam + "_" + f.Date)
-		if !seen[key] {
-			seen[key] = true
-			unique = append(unique, f)
+		u := strings.ToUpper(f.Status)
+		if u == "1H" || u == "2H" || u == "HT" || u == "ET" || u == "P" || u == "IN_PLAY" {
+			live = append(live, f)
+		} else if u == "FT" || u == "AET" || u == "PEN" {
+			ft = append(ft, f)
+		} else {
+			ns = append(ns, f)
 		}
 	}
+	sorted := append(append(live, ns...), ft...)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"date":     date,
-		"count":    len(unique),
-		"fixtures": unique,
+		"count":    len(sorted),
+		"fixtures": sorted,
 	})
 }
 
-// GET /api/scores/live
+// GET /api/scores/live — currently live matches only
 func (s *Server) handleLiveScores(w http.ResponseWriter, r *http.Request) {
 	date := time.Now().Format("2006-01-02")
-	fixtures, _ := s.fetchTSDB(date)
+	fixtures, err := s.fetchAPIFootball(date)
+	if err != nil || len(fixtures) == 0 {
+		fixtures, _ = s.fetchTSDB(date)
+	}
 
 	var live []Fixture
 	for _, f := range fixtures {
 		u := strings.ToUpper(f.Status)
-		if strings.Contains(u, "PLAY") || strings.Contains(u, "LIVE") ||
-			u == "HT" || u == "IN_PLAY" || strings.Contains(u, "1H") || strings.Contains(u, "2H") {
+		if u == "1H" || u == "2H" || u == "HT" || u == "ET" || u == "P" || u == "IN_PLAY" {
 			live = append(live, f)
 		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"date":     date,
-		"count":    len(live),
-		"fixtures": live,
+		"date": date, "count": len(live), "fixtures": live,
 	})
 }
 
@@ -427,10 +435,8 @@ func (s *Server) handleLiveScores(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleSearchScores(w http.ResponseWriter, r *http.Request) {
 	q := strings.ToLower(r.URL.Query().Get("q"))
 	if q == "" { jsonErr(w, "q required", 400); return }
-
 	date := time.Now().Format("2006-01-02")
-	fixtures, _ := s.fetchTSDB(date)
-
+	fixtures, _ := s.fetchAPIFootball(date)
 	var results []Fixture
 	for _, f := range fixtures {
 		if strings.Contains(strings.ToLower(f.HomeTeam), q) ||
@@ -438,11 +444,10 @@ func (s *Server) handleSearchScores(w http.ResponseWriter, r *http.Request) {
 			results = append(results, f)
 		}
 	}
-
 	jsonOK(w, map[string]interface{}{"results": results})
 }
 
-// ─── AI — Google Gemini ───────────────────────────────────────────
+// ─── AI: Google Gemini ────────────────────────────────────────────
 type AIRequest struct {
 	Prompt  string   `json:"prompt"`
 	Markets []string `json:"markets,omitempty"`
@@ -458,25 +463,22 @@ func (s *Server) handleAI(w http.ResponseWriter, r *http.Request) {
 
 	payload := map[string]interface{}{
 		"contents": []map[string]interface{}{
-			{"parts": []map[string]string{
-				{"text": fmt.Sprintf(`You are Dior Sports Padi AI — elite football analyst and betting intelligence engine.
-You have deep knowledge of football matches, team form, injuries, and betting markets.
-Be specific with real team names, player names, recent results, and statistics.
-Format with clear emoji-headed sections. Be confident, punchy, and actionable.
+			{"parts": []map[string]string{{"text": fmt.Sprintf(
+				`You are Dior Sports Padi AI — elite football analyst and betting engine.
+You have deep knowledge of football, team form, injuries, and betting markets.
+Use real team names, real statistics, real results.
+Format with emoji headers. Be confident and actionable.
 Today: %s.
 
-%s`, time.Now().Format("Monday 2 January 2006"), req.Prompt)},
-			}},
+%s`, time.Now().Format("Monday 2 January 2006"), req.Prompt)}}},
 		},
 		"generationConfig": map[string]interface{}{
-			"temperature":     0.7,
-			"maxOutputTokens": 1000,
+			"temperature": 0.7, "maxOutputTokens": 1000,
 		},
 	}
 
 	payloadBytes, _ := json.Marshal(payload)
 	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=%s", geminiKey)
-
 	apiReq, _ := http.NewRequest("POST", url, strings.NewReader(string(payloadBytes)))
 	apiReq.Header.Set("Content-Type", "application/json")
 
@@ -494,18 +496,12 @@ Today: %s.
 		Error *struct{ Message string `json:"message"` } `json:"error"`
 	}
 	json.Unmarshal(body, &geminiResp)
+	if geminiResp.Error != nil { jsonErr(w, "Gemini: "+geminiResp.Error.Message, 502); return }
 
-	if geminiResp.Error != nil {
-		jsonErr(w, "Gemini: "+geminiResp.Error.Message, 502); return
-	}
-
-	var result string
+	result := "No response generated."
 	if len(geminiResp.Candidates) > 0 && len(geminiResp.Candidates[0].Content.Parts) > 0 {
 		result = geminiResp.Candidates[0].Content.Parts[0].Text
-	} else {
-		result = "No response generated."
 	}
-
 	jsonOK(w, map[string]string{"result": result})
 }
 
@@ -523,11 +519,9 @@ func (s *Server) handleSaveTicket(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGetTickets(w http.ResponseWriter, r *http.Request) {
 	uid := r.Context().Value("uid").(string)
-	cursor, err := s.db.Collection("tickets").Find(
-		r.Context(),
+	cursor, err := s.db.Collection("tickets").Find(r.Context(),
 		bson.M{"userId": uid},
-		options.Find().SetSort(bson.M{"createdAt": -1}).SetLimit(20),
-	)
+		options.Find().SetSort(bson.M{"createdAt": -1}).SetLimit(20))
 	if err != nil { jsonErr(w, err.Error(), 500); return }
 	var tickets []SavedTicket
 	cursor.All(r.Context(), &tickets)
@@ -545,7 +539,6 @@ func main() {
 	defer mongoClient.Disconnect(ctx)
 	if err = mongoClient.Ping(ctx, nil); err != nil { log.Fatalf("MongoDB ping: %v", err) }
 	log.Println("✅ MongoDB connected")
-	db := mongoClient.Database("dior_sports_padi")
 
 	opt := option.WithCredentialsFile(firebaseCredsPath)
 	app, err := firebase.NewApp(ctx, nil, opt)
@@ -554,7 +547,7 @@ func main() {
 	if err != nil { log.Fatalf("Firebase auth: %v", err) }
 	log.Println("✅ Firebase connected")
 
-	srv := NewServer(db, fireAuth)
+	srv := NewServer(mongoClient.Database("dior_sports_padi"), fireAuth)
 	r := mux.NewRouter()
 	api := r.PathPrefix("/api").Subrouter()
 
@@ -575,7 +568,7 @@ func main() {
 		AllowCredentials: true,
 	})
 
-	log.Printf("🚀 Dior Sports Padi running on :%s", port)
+	log.Printf("🚀 Dior Sports Padi backend on :%s", port)
 	log.Fatal(http.ListenAndServe(":"+port, c.Handler(r)))
 }
 
