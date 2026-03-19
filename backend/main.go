@@ -477,7 +477,7 @@ Today: %s.
 	}
 
 	payloadBytes, _ := json.Marshal(payload)
-	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=%s", geminiKey)
+	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=%s", geminiKey)
 	apiReq, _ := http.NewRequest("POST", url, strings.NewReader(string(payloadBytes)))
 	apiReq.Header.Set("Content-Type", "application/json")
 
